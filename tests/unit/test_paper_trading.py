@@ -21,7 +21,15 @@ class TestPaperConfig(unittest.TestCase):
             config.initial_balance_idr,
             Decimal("1000000"),
         )
-        self.assertEqual(config.fee_rate, Decimal("0.002"))
+        self.assertIsNone(config.fee_rate)
+        self.assertEqual(
+            config.buy_fee_rate,
+            Decimal("0.0020555"),
+        )
+        self.assertEqual(
+            config.sell_fee_rate,
+            Decimal("0.0041555"),
+        )
 
     def test_rejects_non_positive_balance(self):
         with self.assertRaises(ValueError):
@@ -231,10 +239,10 @@ class TestPaperTradingEngine(unittest.TestCase):
         )
 
         self.assertEqual(trade.status, OrderStatus.FILLED)
-        self.assertEqual(trade.fee_idr, Decimal("800.00000"))
+        self.assertEqual(trade.fee_idr, Decimal("822.200000000"))
         self.assertEqual(
             self.engine.cash_balance_idr,
-            Decimal("599200.00000"),
+            Decimal("599177.800000000"),
         )
         self.assertEqual(
             self.engine.positions["ETH/IDR"].quantity,
@@ -257,14 +265,14 @@ class TestPaperTradingEngine(unittest.TestCase):
         )
 
         self.assertEqual(trade.status, OrderStatus.FILLED)
-        self.assertEqual(trade.fee_idr, Decimal("820.00000"))
+        self.assertEqual(trade.fee_idr, Decimal("1703.755000000"))
         self.assertEqual(
             self.engine.realized_pnl_idr,
-            Decimal("8380.00000"),
+            Decimal("7474.045000000"),
         )
         self.assertEqual(
             self.engine.cash_balance_idr,
-            Decimal("1008380.00000"),
+            Decimal("1007474.045000000"),
         )
         self.assertNotIn("ETH/IDR", self.engine.positions)
 
@@ -396,7 +404,7 @@ class TestPaperTradingEngine(unittest.TestCase):
         )
         self.assertEqual(
             self.engine.positions["ETH/IDR"].entry_fee_idr,
-            Decimal("800.00000"),
+            Decimal("822.200000000"),
         )
 
         
@@ -426,11 +434,11 @@ class TestPaperTradingEngine(unittest.TestCase):
         )
         self.assertEqual(
             position.entry_fee_idr,
-            Decimal("1800.00000"),
+            Decimal("1849.950000000"),
         )
         self.assertEqual(
             engine.cash_balance_idr,
-            initial_balance - Decimal("901800"),
+            Decimal("98150.050000000"),
         )
 
 
@@ -471,7 +479,7 @@ class TestPaperTradingEngine(unittest.TestCase):
         self.assertNotIn("ETH/IDR", engine.positions)
         self.assertEqual(
             engine.realized_pnl_idr,
-            Decimal("98200"),
+            Decimal("97100.050000000"),
         )
 
     def test_buy_rejects_nan_quantity(self):
@@ -576,7 +584,7 @@ class TestPaperTradingEngine(unittest.TestCase):
         self.assertEqual(len(engine.trades), 3)
         self.assertEqual(
             engine.realized_pnl_idr,
-            Decimal("98200"),
+            Decimal("97100.050000000"),
         )
 
 
@@ -619,7 +627,7 @@ class TestPaperTradingEngine(unittest.TestCase):
         self.assertEqual(len(engine.trades), 4)
         self.assertEqual(
             engine.realized_pnl_idr,
-            Decimal("96600"),
+            Decimal("94615.6500000000"),
         )
     
     def test_buy_with_extreme_finite_values_does_not_corrupt_state(self):

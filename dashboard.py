@@ -1,15 +1,27 @@
-
 from __future__ import annotations
 
 import sqlite3
+import time
+import json
+import math
+from urllib.request import Request, urlopen
+from decimal import Decimal, InvalidOperation
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
+import ccxt
 import pandas as pd
 import plotly.express as px
 import streamlit as st
 
 from app.config import load_settings
+from app.indodax_private import IndodaxPrivateClient
+from app.paper_trading.engine import PaperTradingEngine
+from app.paper_trading.models import OrderStatus, PaperConfig
+from app.account_valuation import (
+    get_asset_idr_prices,
+    get_usd_idr_rate,
+)
 
 
 # ============================================================
@@ -17,7 +29,7 @@ from app.config import load_settings
 # ============================================================
 
 st.set_page_config(
-    page_title="Crypto Bot Dashboard",
+    page_title="Crypto Trading Bot",
     page_icon="📊",
     layout="wide",
     initial_sidebar_state="expanded",
@@ -29,6 +41,38 @@ MAX_SCAN_HISTORY_ROWS = 500
 
 
 # ============================================================
+# HELPER
+# ============================================================
+
+def format_rupiah(value: float | int | Decimal) -> str:
+    return f"Rp{float(value):,.2f}"
+
+
+def format_timestamp(timestamp_ms: int | None) -> str:
+    if timestamp_ms is None:
+        return "Belum ada data"
+    timestamp = pd.to_datetime(
+        timestamp_ms, unit="ms", utc=True
+    ).tz_convert(LOCAL_TZ)
+    return timestamp.strftime("%d-%m-%Y %H:%M:%S WIB")
+
+
+def safe_int(value: object) -> int:
+    numeric = pd.to_numeric(value, errors="coerce")
+    if pd.isna(numeric):
+        return 0
+    return int(numeric)
+
+
+def get_exchange(exchange_id: str):
+    """Buat exchange publik CCXT. Fungsi ini tidak membuat order."""
+    exchange_class = getattr(ccxt, exchange_id, None)
+    if exchange_class is None:
+        raise ValueError(f"Exchange CCXT tidak dikenal: {exchange_id}")
+    return exchange_class({"enableRateLimit": True})
+
+
+# ============================================================
 # DATABASE: MARKET SNAPSHOTS (READ-ONLY)
 # ============================================================
 
@@ -37,25 +81,12 @@ def load_snapshot_data(
     database_path: str,
 ) -> tuple[pd.DataFrame, dict[str, int | None]]:
     """Membaca snapshot pasar tanpa mengubah database."""
-
-    path = Path(database_path).resolve()
-
-    empty_df = pd.DataFrame(
-        columns=[
-            "id",
-            "timestamp_ms",
-            "exchange",
-            "symbol",
-            "bid",
-            "ask",
-            "spread_pct",
-            "quote_volume_idr",
-            "net_profit_idr",
-            "net_profit_pct",
-            "timestamp",
-        ]
-    )
-
+    columns = [
+        "id", "timestamp_ms", "exchange", "symbol", "bid", "ask",
+        "spread_pct", "quote_volume_idr", "net_profit_idr",
+        "net_profit_pct", "timestamp",
+    ]
+    empty_df = pd.DataFrame(columns=columns)
     empty_stats: dict[str, int | None] = {
         "total_snapshots": 0,
         "total_symbols": 0,
@@ -63,70 +94,46 @@ def load_snapshot_data(
         "oldest_timestamp_ms": None,
     }
 
+    path = Path(database_path).resolve()
     if not path.is_file():
         return empty_df, empty_stats
 
     uri = path.as_uri() + "?mode=ro"
-
     try:
         with sqlite3.connect(uri, uri=True, timeout=5) as connection:
             connection.execute("PRAGMA query_only = ON")
-
-            table_exists = connection.execute(
+            exists = connection.execute(
                 """
-                SELECT 1
-                FROM sqlite_master
-                WHERE type = 'table'
-                  AND name = 'market_snapshots'
+                SELECT 1 FROM sqlite_master
+                WHERE type = 'table' AND name = 'market_snapshots'
                 LIMIT 1
                 """
             ).fetchone()
-
-            if table_exists is None:
+            if exists is None:
                 return empty_df, empty_stats
 
-            stats_row = connection.execute(
+            row = connection.execute(
                 """
-                SELECT
-                    COUNT(*),
-                    COUNT(DISTINCT symbol),
-                    MAX(timestamp_ms),
-                    MIN(timestamp_ms)
+                SELECT COUNT(*), COUNT(DISTINCT symbol),
+                       MAX(timestamp_ms), MIN(timestamp_ms)
                 FROM market_snapshots
                 """
             ).fetchone()
 
             stats = {
-                "total_snapshots": int(stats_row[0] or 0),
-                "total_symbols": int(stats_row[1] or 0),
-                "latest_timestamp_ms": (
-                    int(stats_row[2])
-                    if stats_row[2] is not None
-                    else None
-                ),
-                "oldest_timestamp_ms": (
-                    int(stats_row[3])
-                    if stats_row[3] is not None
-                    else None
-                ),
+                "total_snapshots": int(row[0] or 0),
+                "total_symbols": int(row[1] or 0),
+                "latest_timestamp_ms": int(row[2]) if row[2] is not None else None,
+                "oldest_timestamp_ms": int(row[3]) if row[3] is not None else None,
             }
-
             if stats["total_snapshots"] == 0:
                 return empty_df, stats
 
             df = pd.read_sql_query(
                 """
-                SELECT
-                    id,
-                    timestamp_ms,
-                    exchange,
-                    symbol,
-                    bid,
-                    ask,
-                    spread_pct,
-                    quote_volume_idr,
-                    net_profit_idr,
-                    net_profit_pct
+                SELECT id, timestamp_ms, exchange, symbol, bid, ask,
+                       spread_pct, quote_volume_idr, net_profit_idr,
+                       net_profit_pct
                 FROM market_snapshots
                 ORDER BY timestamp_ms DESC, id DESC
                 LIMIT ?
@@ -134,47 +141,25 @@ def load_snapshot_data(
                 connection,
                 params=(MAX_DISPLAY_ROWS,),
             )
-
     except sqlite3.Error as exc:
-        raise RuntimeError(
-            f"Gagal membaca database snapshot: {exc}"
-        ) from exc
+        raise RuntimeError(f"Gagal membaca database snapshot: {exc}") from exc
 
     if df.empty:
         return empty_df, stats
 
-    numeric_columns = [
-        "timestamp_ms",
-        "bid",
-        "ask",
-        "spread_pct",
-        "quote_volume_idr",
-        "net_profit_idr",
-        "net_profit_pct",
-    ]
-
-    for column in numeric_columns:
+    for column in [
+        "timestamp_ms", "bid", "ask", "spread_pct", "quote_volume_idr",
+        "net_profit_idr", "net_profit_pct",
+    ]:
         df[column] = pd.to_numeric(df[column], errors="coerce")
 
     df["timestamp"] = (
-        pd.to_datetime(
-            df["timestamp_ms"],
-            unit="ms",
-            utc=True,
-            errors="coerce",
-        )
+        pd.to_datetime(df["timestamp_ms"], unit="ms", utc=True, errors="coerce")
         .dt.tz_convert(LOCAL_TZ)
     )
-
     df = df.dropna(
-        subset=[
-            "timestamp",
-            "symbol",
-            "net_profit_idr",
-            "net_profit_pct",
-        ]
+        subset=["timestamp", "symbol", "net_profit_idr", "net_profit_pct"]
     )
-
     return df, stats
 
 
@@ -185,74 +170,41 @@ def load_snapshot_data(
 @st.cache_data(ttl=10)
 def load_scan_diagnostics(database_path: str) -> pd.DataFrame:
     """Membaca riwayat scanner tanpa menjalankan scanner."""
-
     columns = [
-        "id",
-        "started_at_ms",
-        "finished_at_ms",
-        "duration_ms",
-        "status",
-        "candidates_found",
-        "order_books_attempted",
-        "order_books_failed",
-        "invalid_order_books",
-        "invalid_market_metadata",
-        "insufficient_depth",
-        "estimation_errors",
-        "below_profit_target",
-        "profitable_candidates",
-        "snapshots_saved",
-        "snapshot_save_failures",
-        "error_type",
-        "error_message",
+        "id", "started_at_ms", "finished_at_ms", "duration_ms", "status",
+        "candidates_found", "order_books_attempted", "order_books_failed",
+        "invalid_order_books", "invalid_market_metadata", "insufficient_depth",
+        "estimation_errors", "below_profit_target", "profitable_candidates",
+        "snapshots_saved", "snapshot_save_failures", "error_type", "error_message",
+        "started_at", "finished_at",
     ]
-
     empty_df = pd.DataFrame(columns=columns)
     path = Path(database_path).resolve()
-
     if not path.is_file():
         return empty_df
 
     uri = path.as_uri() + "?mode=ro"
-
     try:
         with sqlite3.connect(uri, uri=True, timeout=5) as connection:
             connection.execute("PRAGMA query_only = ON")
-
-            table_exists = connection.execute(
+            exists = connection.execute(
                 """
-                SELECT 1
-                FROM sqlite_master
-                WHERE type = 'table'
-                  AND name = 'scan_runs'
+                SELECT 1 FROM sqlite_master
+                WHERE type = 'table' AND name = 'scan_runs'
                 LIMIT 1
                 """
             ).fetchone()
-
-            if table_exists is None:
+            if exists is None:
                 return empty_df
 
             df = pd.read_sql_query(
                 """
-                SELECT
-                    id,
-                    started_at_ms,
-                    finished_at_ms,
-                    duration_ms,
-                    status,
-                    candidates_found,
-                    order_books_attempted,
-                    order_books_failed,
-                    invalid_order_books,
-                    invalid_market_metadata,
-                    insufficient_depth,
-                    estimation_errors,
-                    below_profit_target,
-                    profitable_candidates,
-                    snapshots_saved,
-                    snapshot_save_failures,
-                    error_type,
-                    error_message
+                SELECT id, started_at_ms, finished_at_ms, duration_ms, status,
+                       candidates_found, order_books_attempted, order_books_failed,
+                       invalid_order_books, invalid_market_metadata,
+                       insufficient_depth, estimation_errors, below_profit_target,
+                       profitable_candidates, snapshots_saved,
+                       snapshot_save_failures, error_type, error_message
                 FROM scan_runs
                 ORDER BY started_at_ms DESC, id DESC
                 LIMIT ?
@@ -260,7 +212,6 @@ def load_scan_diagnostics(database_path: str) -> pd.DataFrame:
                 connection,
                 params=(MAX_SCAN_HISTORY_ROWS,),
             )
-
     except sqlite3.Error as exc:
         raise RuntimeError(
             f"Gagal membaca riwayat diagnostik scanner: {exc}"
@@ -270,465 +221,674 @@ def load_scan_diagnostics(database_path: str) -> pd.DataFrame:
         return empty_df
 
     numeric_columns = [
-        "id",
-        "started_at_ms",
-        "finished_at_ms",
-        "duration_ms",
-        "candidates_found",
-        "order_books_attempted",
-        "order_books_failed",
-        "invalid_order_books",
-        "invalid_market_metadata",
-        "insufficient_depth",
-        "estimation_errors",
-        "below_profit_target",
-        "profitable_candidates",
-        "snapshots_saved",
-        "snapshot_save_failures",
+        "id", "started_at_ms", "finished_at_ms", "duration_ms",
+        "candidates_found", "order_books_attempted", "order_books_failed",
+        "invalid_order_books", "invalid_market_metadata", "insufficient_depth",
+        "estimation_errors", "below_profit_target", "profitable_candidates",
+        "snapshots_saved", "snapshot_save_failures",
     ]
-
     for column in numeric_columns:
         df[column] = pd.to_numeric(df[column], errors="coerce")
 
     df["started_at"] = (
-        pd.to_datetime(
-            df["started_at_ms"],
-            unit="ms",
-            utc=True,
-            errors="coerce",
-        )
+        pd.to_datetime(df["started_at_ms"], unit="ms", utc=True, errors="coerce")
         .dt.tz_convert(LOCAL_TZ)
     )
-
     df["finished_at"] = (
-        pd.to_datetime(
-            df["finished_at_ms"],
-            unit="ms",
-            utc=True,
-            errors="coerce",
-        )
+        pd.to_datetime(df["finished_at_ms"], unit="ms", utc=True, errors="coerce")
         .dt.tz_convert(LOCAL_TZ)
     )
-
     return df
 
 
 # ============================================================
-# HELPER
+# HALAMAN: PAPER TRADING
 # ============================================================
 
-def format_rupiah(value: float | int) -> str:
-    return f"Rp{value:,.2f}"
-
-
-def format_timestamp(timestamp_ms: int | None) -> str:
-    if timestamp_ms is None:
-        return "Belum ada data"
-
-    timestamp = pd.to_datetime(
-        timestamp_ms,
-        unit="ms",
-        utc=True,
-    ).tz_convert(LOCAL_TZ)
-
-    return timestamp.strftime("%d-%m-%Y %H:%M:%S WIB")
-
-
-def safe_int(value: object) -> int:
-    numeric = pd.to_numeric(value, errors="coerce")
-
-    if pd.isna(numeric):
-        return 0
-
-    return int(numeric)
-
-
-# ============================================================
-# HEADER DAN VALIDASI MODE
-# ============================================================
-
-st.title("📊 Crypto Trading Bot")
-st.caption(
-    "Dashboard evaluasi market Indodax, snapshot pasar, "
-    "dan diagnostik scanner."
-)
-
-try:
-    settings = load_settings()
-except (ValueError, OSError) as exc:
-    st.error(f"Konfigurasi aplikasi tidak valid: {exc}")
-    st.stop()
-
-if settings.trading_mode != "PAPER":
-    st.error(
-        "Dashboard hanya mengizinkan mode PAPER. "
-        "Periksa konfigurasi aplikasi sebelum melanjutkan."
-    )
-    st.stop()
-
-with st.sidebar:
-    st.header("Pengaturan")
-
-    st.success("Mode: PAPER")
-    st.write(f"Exchange: `{settings.exchange_id}`")
-    st.write(f"Market: `{settings.market_type}`")
-    st.write(f"Timeframe: `{settings.timeframe}`")
-
-    st.caption("Dashboard hanya membaca data tersimpan.")
-    st.caption("Tidak ada order yang dikirim.")
-    st.caption("Halaman ini tidak menjalankan scan otomatis.")
-
-    if st.button("🔄 Muat ulang data", width="stretch"):
-        st.cache_data.clear()
-        st.rerun()
-
-    st.divider()
-    st.caption("Database")
-    st.code(str(settings.database_path), language="text")
-
-
-# ============================================================
-# MEMUAT DATA
-# ============================================================
-
-try:
-    df, stats = load_snapshot_data(str(settings.database_path))
-except RuntimeError as exc:
-    st.error(str(exc))
-    st.stop()
-
-try:
-    scan_df = load_scan_diagnostics(str(settings.database_path))
-except RuntimeError as exc:
-    st.error(str(exc))
-    scan_df = pd.DataFrame()
-
-
-# ============================================================
-# BAGIAN 1: DIAGNOSTIK SCANNER
-# ============================================================
-
-st.header("Diagnostik Scanner")
-st.caption(
-    "Ringkasan pemindaian berdasarkan riwayat tersimpan. "
-    "Dashboard tidak menjalankan scanner."
-)
-
-if scan_df.empty:
-    st.info(
-        "Belum ada riwayat scan yang tersedia. "
-        "Pastikan scanner menyimpan riwayat ke tabel scan_runs."
-    )
-
-    col1, col2, col3, col4 = st.columns(4)
-
-    col1.metric("Riwayat scan dimuat", 0)
-    col2.metric("Kandidat terakhir", 0)
-    col3.metric("Peluang profitable", 0)
-    col4.metric("Durasi terakhir", "Belum ada")
-
-else:
-    latest_scan = scan_df.iloc[0]
-
-    total_scans = len(scan_df)
-    completed_scans = int(
-        (scan_df["status"] == "completed").sum()
-    )
-    failed_scans = int(
-        (scan_df["status"] == "failed").sum()
-    )
-
-    col1, col2, col3, col4 = st.columns(4)
-
-    col1.metric("Riwayat scan dimuat", f"{total_scans:,}")
-    col2.metric(
-        "Kandidat scan terakhir",
-        f"{safe_int(latest_scan['candidates_found']):,}",
-    )
-    col3.metric(
-        "Peluang profitable terakhir",
-        f"{safe_int(latest_scan['profitable_candidates']):,}",
-    )
-    col4.metric(
-        "Durasi scan terakhir",
-        f"{safe_int(latest_scan['duration_ms']):,} ms",
-    )
-
-    if pd.notna(latest_scan["started_at"]):
-        st.caption(
-            "Waktu scan terakhir: "
-            f"{latest_scan['started_at'].strftime('%d-%m-%Y %H:%M:%S WIB')}"
-        )
-
-    col1, col2, col3, col4 = st.columns(4)
-
-    col1.metric("Scan completed", f"{completed_scans:,}")
-    col2.metric("Scan failed", f"{failed_scans:,}")
-    col3.metric(
-        "Order book diperiksa",
-        f"{safe_int(latest_scan['order_books_attempted']):,}",
-    )
-    col4.metric(
-        "Snapshot tersimpan",
-        f"{safe_int(latest_scan['snapshots_saved']):,}",
-    )
-
-    if latest_scan["status"] == "failed":
-        st.error(
-            "Scan terakhir berstatus FAILED. "
-            f"Tipe error: {latest_scan['error_type'] or 'Tidak diketahui'}. "
-            f"Pesan: {latest_scan['error_message'] or 'Tidak ada detail error'}"
-        )
-
-    st.divider()
-    st.subheader("Hasil pemeriksaan scan terakhir")
-
-    rejection_labels = {
-        "Order book gagal": "order_books_failed",
-        "Order book tidak valid": "invalid_order_books",
-        "Metadata market tidak valid": "invalid_market_metadata",
-        "Kedalaman order book kurang": "insufficient_depth",
-        "Error estimasi": "estimation_errors",
-        "Di bawah target profit": "below_profit_target",
-    }
-
-    rejection_data = pd.DataFrame(
-        [
-            {
-                "Kategori": label,
-                "Jumlah": safe_int(latest_scan[column]),
-            }
-            for label, column in rejection_labels.items()
-        ]
-    ).sort_values("Jumlah", ascending=True)
-
-    fig_rejections = px.bar(
-        rejection_data,
-        x="Jumlah",
-        y="Kategori",
-        orientation="h",
-        text="Jumlah",
-        title="Kategori diagnostik pada scan terakhir",
-    )
-
-    fig_rejections.update_layout(
-        showlegend=False,
-        margin=dict(l=10, r=10, t=50, b=10),
-    )
-
-    st.plotly_chart(
-        fig_rejections,
-        width="stretch",
-    )
-
+def render_paper_dashboard(settings) -> None:
+    st.header("Paper Trading")
     st.caption(
-        "Kategori diagnostik bukan selalu jumlah kandidat unik. "
-        "Satu kandidat dapat melewati beberapa tahap pemeriksaan."
+        "Simulasi dengan saldo virtual. Tidak memakai saldo Indodax dan "
+        "tidak mengirim order ke exchange."
     )
+
+    if "paper_engine" not in st.session_state:
+        st.session_state.paper_engine = PaperTradingEngine(
+            PaperConfig(initial_balance_idr=Decimal("1000000"))
+        )
+    engine = st.session_state.paper_engine
+
+    col1, col2, col3 = st.columns(3)
+    col1.metric("Saldo virtual", format_rupiah(engine.cash_balance_idr))
+    col2.metric("Posisi terbuka", len(engine.positions))
+    col3.metric("Profit terealisasi", format_rupiah(engine.realized_pnl_idr))
+
+    st.info(
+        "Saldo awal Rp1.000.000 dengan fee simulasi 0,2%. "
+        "Data bertahan selama sesi Streamlit aktif, tetapi belum persisten "
+        "setelah sesi berakhir atau server dimulai ulang."
+    )
+
+    st.subheader("Harga pasar")
+    symbol = st.selectbox(
+        "Market",
+        ["BTC/IDR", "ETH/IDR", "SOL/IDR", "XLM/IDR"],
+        key="paper_symbol",
+    )
+
+    if st.button("Perbarui harga", key="paper_refresh_price"):
+        st.session_state.pop("paper_ticker", None)
+
+    ticker_state = st.session_state.get("paper_ticker")
+    if (
+        not isinstance(ticker_state, dict)
+        or ticker_state.get("symbol") != symbol
+        or time.time() - ticker_state.get("fetched_at", 0) > 15
+    ):
+        try:
+            exchange = get_exchange(settings.exchange_id)
+            ticker_data = exchange.fetch_ticker(symbol)
+            ticker_state = {
+                "symbol": symbol,
+                "last": ticker_data.get("last"),
+                "bid": ticker_data.get("bid"),
+                "ask": ticker_data.get("ask"),
+                "fetched_at": time.time(),
+            }
+            st.session_state.paper_ticker = ticker_state
+        except (ccxt.BaseError, ValueError, AttributeError) as exc:
+            st.error(f"Gagal mengambil harga publik: {exc}")
+            ticker_state = None
+
+    if ticker_state:
+        last_price = ticker_state.get("last")
+        bid = ticker_state.get("bid")
+        ask = ticker_state.get("ask")
+        price_cols = st.columns(3)
+        price_cols[0].metric(
+            "Harga terakhir",
+            format_rupiah(last_price) if last_price is not None else "Tidak tersedia",
+        )
+        price_cols[1].metric(
+            "Bid",
+            format_rupiah(bid) if bid is not None else "Tidak tersedia",
+        )
+        price_cols[2].metric(
+            "Ask",
+            format_rupiah(ask) if ask is not None else "Tidak tersedia",
+        )
+
+        st.caption("Beli menggunakan ask (atau harga terakhir sebagai fallback); jual menggunakan bid (atau harga terakhir).")
+
+        st.subheader("Simulasi beli")
+        with st.form("paper_buy_form"):
+            buy_quantity_text = st.text_input(
+                f"Jumlah {symbol.split('/')[0]}",
+                value="0.001",
+            )
+            buy_confirm = st.checkbox(
+                "Konfirmasi: ini hanya transaksi simulasi.",
+                key="paper_buy_confirm",
+            )
+            buy_submit = st.form_submit_button("Simulasikan beli")
+
+        if buy_submit:
+            try:
+                quantity = Decimal(buy_quantity_text)
+                price_value = ask if ask is not None else last_price
+                if not buy_confirm:
+                    st.warning("Centang konfirmasi simulasi terlebih dahulu.")
+                elif price_value is None:
+                    st.error("Harga beli tidak tersedia.")
+                elif not quantity.is_finite() or quantity <= 0:
+                    st.error("Jumlah harus berupa angka positif yang valid.")
+                else:
+                    trade = engine.buy(
+                        symbol=symbol,
+                        quantity=quantity,
+                        price=Decimal(str(price_value)),
+                        timestamp_ms=int(time.time() * 1000),
+                    )
+                    if trade.status == OrderStatus.FILLED:
+                        st.success(f"Simulasi beli berhasil: {quantity} {symbol.split('/')[0]}.")
+                    else:
+                        st.warning(trade.reason or "Transaksi simulasi ditolak.")
+                    st.rerun()
+            except (InvalidOperation, ValueError) as exc:
+                st.error(f"Transaksi tidak valid: {exc}")
+
+        st.subheader("Simulasi jual")
+        position = engine.positions.get(symbol)
+        if position is None:
+            st.info(f"Belum ada posisi {symbol} untuk dijual.")
+        else:
+            st.write(f"Posisi tersedia: {position.quantity}")
+            with st.form("paper_sell_form"):
+                sell_quantity_text = st.text_input(
+                    f"Jumlah {symbol.split('/')[0]} yang dijual",
+                    value=str(position.quantity),
+                )
+                sell_confirm = st.checkbox(
+                    "Konfirmasi: ini hanya transaksi simulasi.",
+                    key="paper_sell_confirm",
+                )
+                sell_submit = st.form_submit_button("Simulasikan jual")
+
+            if sell_submit:
+                try:
+                    quantity = Decimal(sell_quantity_text)
+                    price_value = bid if bid is not None else last_price
+                    if not sell_confirm:
+                        st.warning("Centang konfirmasi simulasi terlebih dahulu.")
+                    elif price_value is None:
+                        st.error("Harga jual tidak tersedia.")
+                    elif not quantity.is_finite() or quantity <= 0:
+                        st.error("Jumlah harus berupa angka positif yang valid.")
+                    else:
+                        trade = engine.sell(
+                            symbol=symbol,
+                            quantity=quantity,
+                            price=Decimal(str(price_value)),
+                            timestamp_ms=int(time.time() * 1000),
+                        )
+                        if trade.status == OrderStatus.FILLED:
+                            st.success(f"Simulasi jual berhasil: {quantity} {symbol.split('/')[0]}.")
+                        else:
+                            st.warning(trade.reason or "Transaksi simulasi ditolak.")
+                        st.rerun()
+                except (InvalidOperation, ValueError) as exc:
+                    st.error(f"Transaksi tidak valid: {exc}")
 
     st.divider()
-    st.subheader("Tren diagnostik")
+    st.subheader("Posisi simulasi")
+    if engine.positions:
+        positions_data = [
+            {
+                "Market": position.symbol,
+                "Jumlah": str(position.quantity),
+                "Harga rata-rata entry (IDR)": float(position.average_entry_price),
+                "Fee entry (IDR)": float(position.entry_fee_idr),
+            }
+            for position in engine.positions.values()
+        ]
+        st.dataframe(pd.DataFrame(positions_data), width="stretch", hide_index=True)
+    else:
+        st.info("Belum ada posisi simulasi.")
 
-    trend_df = scan_df.dropna(
-        subset=["started_at"]
-    ).sort_values(
-        ["started_at_ms", "id"]
-    ).copy()
-
-    trend_metric = st.selectbox(
-        "Metrik tren",
-        options=[
-            "Jumlah kandidat",
-            "Peluang profitable",
-            "Order book diperiksa",
-            "Order book gagal",
-            "Durasi scan (ms)",
-            "Snapshot tersimpan",
-        ],
-    )
-
-    trend_mapping = {
-        "Jumlah kandidat": (
-            "candidates_found",
-            "Jumlah kandidat",
-        ),
-        "Peluang profitable": (
-            "profitable_candidates",
-            "Jumlah peluang profitable",
-        ),
-        "Order book diperiksa": (
-            "order_books_attempted",
-            "Jumlah order book diperiksa",
-        ),
-        "Order book gagal": (
-            "order_books_failed",
-            "Jumlah order book gagal",
-        ),
-        "Durasi scan (ms)": (
-            "duration_ms",
-            "Durasi scan (ms)",
-        ),
-        "Snapshot tersimpan": (
-            "snapshots_saved",
-            "Jumlah snapshot tersimpan",
-        ),
-    }
-
-    trend_column, trend_title = trend_mapping[trend_metric]
-
-    if not trend_df.empty:
-        fig_trend = px.line(
-            trend_df,
-            x="started_at",
-            y=trend_column,
-            markers=True,
-            title=trend_title,
-            labels={
-                "started_at": "Waktu scan (WIB)",
-                trend_column: trend_title,
-            },
-        )
-
-        fig_trend.update_layout(
-            hovermode="x unified",
-            margin=dict(l=10, r=10, t=50, b=10),
-        )
-
-        st.plotly_chart(
-            fig_trend,
-            width="stretch",
+    st.subheader("Riwayat transaksi simulasi")
+    if engine.trades:
+        trades_data = [
+            {
+                "Waktu (WIB)": pd.to_datetime(
+                    trade.timestamp_ms, unit="ms", utc=True
+                ).tz_convert(LOCAL_TZ),
+                "Market": trade.symbol,
+                "Sisi": trade.side.value.upper(),
+                "Jumlah": str(trade.quantity),
+                "Harga (IDR)": float(trade.price),
+                "Fee (IDR)": float(trade.fee_idr),
+                "Status": trade.status.value.upper(),
+                "Alasan": trade.reason or "-",
+            }
+            for trade in reversed(engine.trades)
+        ]
+        st.dataframe(pd.DataFrame(trades_data), width="stretch", hide_index=True)
+        st.download_button(
+            "Ekspor transaksi simulasi ke CSV",
+            data=pd.DataFrame(trades_data).to_csv(index=False).encode("utf-8-sig"),
+            file_name="paper_trades.csv",
+            mime="text/csv",
         )
     else:
-        st.info("Waktu scan tidak tersedia untuk membuat grafik tren.")
+        st.info("Belum ada transaksi simulasi.")
 
-    st.divider()
-    st.subheader("Riwayat scan")
 
-    history_columns = [
-        "id",
-        "started_at",
-        "duration_ms",
-        "status",
-        "candidates_found",
-        "order_books_attempted",
-        "order_books_failed",
-        "invalid_order_books",
-        "invalid_market_metadata",
-        "insufficient_depth",
-        "estimation_errors",
-        "below_profit_target",
-        "profitable_candidates",
-        "snapshots_saved",
-        "snapshot_save_failures",
-        "error_type",
-        "error_message",
-    ]
+# ============================================================
+# HALAMAN: AKUN REAL INDODAX (READ-ONLY)
+# ============================================================
 
-    history_df = scan_df[history_columns].copy().rename(
-        columns={
-            "id": "ID",
-            "started_at": "Waktu (WIB)",
-            "duration_ms": "Durasi (ms)",
-            "status": "Status",
-            "candidates_found": "Kandidat",
-            "order_books_attempted": "Order book diperiksa",
-            "order_books_failed": "Order book gagal",
-            "invalid_order_books": "Order book tidak valid",
-            "invalid_market_metadata": "Metadata tidak valid",
-            "insufficient_depth": "Depth kurang",
-            "estimation_errors": "Error estimasi",
-            "below_profit_target": "Di bawah target",
-            "profitable_candidates": "Profitable",
-            "snapshots_saved": "Snapshot tersimpan",
-            "snapshot_save_failures": "Gagal simpan snapshot",
-            "error_type": "Tipe error",
-            "error_message": "Pesan error",
-        }
+def render_real_account_dashboard() -> None:
+    """Menampilkan saldo dan estimasi valuasi akun Indodax, read-only."""
+    st.header("Akun Real Indodax")
+    st.caption("Saldo akun asli. Halaman ini tidak mengirim order.")
+    st.warning(
+        "Nilai IDR dan USD adalah estimasi. Harga pasar dan kurs dapat berubah."
     )
 
+    refresh_keys = (
+        "real_account_balances",
+        "real_account_error",
+        "real_account_prices",
+        "real_account_fx",
+        "real_account_valuation_error",
+        "real_account_prices_error",
+        "real_account_fx_error",
+    )
+
+    if st.button("Muat ulang saldo dan harga", key="real_account_refresh"):
+        for key in refresh_keys:
+            st.session_state.pop(key, None)
+
+    if (
+        "real_account_balances" not in st.session_state
+        and "real_account_error" not in st.session_state
+    ):
+        try:
+            st.session_state["real_account_balances"] = (
+                IndodaxPrivateClient().get_balance_details()
+            )
+        except Exception as exc:
+            st.session_state["real_account_error"] = (
+                f"Gagal membaca saldo ({type(exc).__name__}). "
+                "Periksa API View, konfigurasi .env, dan koneksi."
+            )
+
+    if "real_account_error" in st.session_state:
+        st.error(st.session_state["real_account_error"])
+        return
+
+    balances = st.session_state.get("real_account_balances", {})
+    if not isinstance(balances, dict) or not balances:
+        st.info("Tidak ada saldo aset yang dikembalikan API.")
+        return
+
+    assets = {
+        asset.upper()
+        for asset in balances
+        if isinstance(asset, str) and asset.strip()
+    }
+    assets.add("IDR")
+
+    # Ambil harga aset secara terpisah dari kurs USD/IDR.
+    if "real_account_prices" not in st.session_state:
+        try:
+            exchange = get_exchange("indodax")
+            st.session_state["real_account_prices"] = (
+                get_asset_idr_prices(exchange, assets)
+            )
+            st.session_state.pop("real_account_prices_error", None)
+        except Exception as exc:
+            st.session_state["real_account_prices_error"] = (
+                f"Gagal mengambil harga aset ({type(exc).__name__})."
+            )
+
+    if "real_account_fx" not in st.session_state:
+        try:
+            st.session_state["real_account_fx"] = get_usd_idr_rate()
+            st.session_state.pop("real_account_fx_error", None)
+        except Exception as exc:
+            st.session_state["real_account_fx_error"] = (
+                f"Kurs USD/IDR tidak tersedia ({type(exc).__name__})."
+            )
+
+    prices = st.session_state.get("real_account_prices", {})
+    if not isinstance(prices, dict):
+        prices = {}
+
+    usd_idr = st.session_state.get("real_account_fx")
+    try:
+        usd_idr = Decimal(str(usd_idr)) if usd_idr is not None else None
+        if usd_idr is not None and (
+            not usd_idr.is_finite() or usd_idr <= 0
+        ):
+            usd_idr = None
+    except (InvalidOperation, ValueError, TypeError, ArithmeticError):
+        usd_idr = None
+
+    for key in ("real_account_prices_error", "real_account_fx_error"):
+        message = st.session_state.get(key)
+        if message:
+            st.warning(message)
+
+    if usd_idr is not None:
+        st.caption(f"Kurs referensi: 1 USD = Rp{float(usd_idr):,.2f}")
+
+    def display_number(value):
+        """Hanya mengembalikan angka float yang finite untuk tampilan."""
+        if value is None:
+            return None
+        try:
+            number = float(value)
+        except (ValueError, TypeError, OverflowError):
+            return None
+        return number if math.isfinite(number) else None
+
+    rows = []
+    total_idr = Decimal("0")
+    unpriced = []
+    invalid_balances = []
+
+    for raw_asset, detail in sorted(balances.items(), key=lambda item: str(item[0])):
+        if not isinstance(raw_asset, str) or not raw_asset.strip():
+            unpriced.append(str(raw_asset))
+            continue
+
+        asset = raw_asset.upper()
+
+        if not isinstance(detail, dict):
+            invalid_balances.append(asset)
+            rows.append({
+                "Aset": asset,
+                "Saldo tersedia": "Tidak valid",
+                "Saldo terkunci": "Tidak valid",
+                "Total aset": "Tidak valid",
+                "Harga per aset (IDR)": None,
+                "Estimasi nilai (IDR)": None,
+                "Estimasi nilai (USD)": None,
+            })
+            continue
+
+        try:
+            free = Decimal(str(detail.get("free", 0)))
+            locked = Decimal(str(detail.get("locked", 0)))
+
+            if (
+                not free.is_finite()
+                or not locked.is_finite()
+                or free < 0
+                or locked < 0
+            ):
+                raise ValueError("Saldo negatif atau non-finite")
+
+            total = free + locked
+            if not total.is_finite():
+                raise ValueError("Total saldo non-finite")
+
+        except (InvalidOperation, ValueError, TypeError, ArithmeticError):
+            invalid_balances.append(asset)
+            rows.append({
+                "Aset": asset,
+                "Saldo tersedia": str(detail.get("free", "Tidak valid")),
+                "Saldo terkunci": str(detail.get("locked", "Tidak valid")),
+                "Total aset": "Tidak valid",
+                "Harga per aset (IDR)": None,
+                "Estimasi nilai (IDR)": None,
+                "Estimasi nilai (USD)": None,
+            })
+            continue
+
+        price = Decimal("1") if asset == "IDR" else None
+        if asset != "IDR":
+            raw_price = prices.get(asset)
+            if raw_price is not None:
+                try:
+                    candidate_price = Decimal(str(raw_price))
+                    if candidate_price.is_finite() and candidate_price > 0:
+                        price = candidate_price
+                except (InvalidOperation, ValueError, TypeError, ArithmeticError):
+                    price = None
+
+        value_idr = None
+        value_usd = None
+
+        if price is not None:
+            try:
+                candidate_value = total * price
+                if candidate_value.is_finite() and candidate_value >= 0:
+                    value_idr = candidate_value
+                    if usd_idr is not None:
+                        candidate_usd = value_idr / usd_idr
+                        if candidate_usd.is_finite() and candidate_usd >= 0:
+                            value_usd = candidate_usd
+            except (InvalidOperation, ValueError, TypeError, ArithmeticError):
+                value_idr = None
+                value_usd = None
+
+        if value_idr is None:
+            unpriced.append(asset)
+        else:
+            try:
+                new_total = total_idr + value_idr
+                if new_total.is_finite():
+                    total_idr = new_total
+                else:
+                    unpriced.append(asset)
+            except ArithmeticError:
+                unpriced.append(asset)
+
+        rows.append({
+            "Aset": asset,
+            "Saldo tersedia": str(free),
+            "Saldo terkunci": str(locked),
+            "Total aset": str(total),
+            "Harga per aset (IDR)": display_number(price),
+            "Estimasi nilai (IDR)": display_number(value_idr),
+            "Estimasi nilai (USD)": display_number(value_usd),
+        })
+
+    st.subheader("Ringkasan kekayaan akun")
+    col1, col2, col3 = st.columns(3)
+    col1.metric("Jumlah aset", len(rows))
+
+    total_idr_display = display_number(total_idr)
+    if total_idr_display is None:
+        col2.metric("Total estimasi IDR", "Tidak tersedia")
+        col3.metric("Total estimasi USD", "Tidak tersedia")
+        st.warning("Total valuasi tidak dapat direpresentasikan dengan aman.")
+    else:
+        col2.metric("Total estimasi IDR", f"Rp{total_idr_display:,.2f}")
+        total_usd_display = (
+            display_number(total_idr / usd_idr)
+            if usd_idr is not None
+            else None
+        )
+        if total_usd_display is not None:
+            col3.metric("Total estimasi USD", f"${total_usd_display:,.2f}")
+        else:
+            col3.metric("Total estimasi USD", "Tidak tersedia")
+
+    if invalid_balances:
+        st.error(
+            "Saldo tidak valid dan tidak dimasukkan ke valuasi: "
+            + ", ".join(sorted(set(invalid_balances)))
+        )
+
+    if unpriced:
+        st.warning(
+            "Harga atau hasil valuasi belum tersedia untuk: "
+            + ", ".join(sorted(set(unpriced)))
+            + ". Nilai aset tersebut belum tercakup secara andal dalam total."
+        )
+
+    st.subheader("Rincian saldo seluruh aset")
+    df = pd.DataFrame(rows)
     st.dataframe(
-        history_df,
+        df,
         width="stretch",
         hide_index=True,
-        height=400,
+        column_config={
+            "Harga per aset (IDR)": st.column_config.NumberColumn(format="Rp%.2f"),
+            "Estimasi nilai (IDR)": st.column_config.NumberColumn(format="Rp%.2f"),
+            "Estimasi nilai (USD)": st.column_config.NumberColumn(format="$%.2f"),
+        },
     )
 
     st.download_button(
-        label="Ekspor riwayat scan ke CSV",
-        data=history_df.to_csv(index=False).encode("utf-8-sig"),
-        file_name="scan_diagnostics.csv",
+        "Ekspor saldo ke CSV",
+        data=df.to_csv(index=False).encode("utf-8-sig"),
+        file_name="indodax_account_balances.csv",
         mime="text/csv",
-        width="stretch",
     )
 
-st.divider()
-
-
-# ============================================================
-# BAGIAN 2: SNAPSHOT PASAR
-# ============================================================
-
-st.header("Snapshot Pasar")
-
-if stats["total_snapshots"] == 0 or df.empty:
-    st.info(
-        "Belum ada snapshot pasar yang dapat ditampilkan. "
-        "Bagian diagnostik scanner tetap tersedia."
+    st.caption(
+        "Saldo tersedia dan terkunci ditampilkan terpisah. "
+        "Aset yang tidak memiliki harga valid tidak dinilai sebagai nol."
     )
 
-    col1, col2, col3 = st.columns(3)
 
-    col1.metric("Total snapshot", f"{stats['total_snapshots']:,}")
-    col2.metric("Market tercatat", f"{stats['total_symbols']:,}")
-    col3.metric(
-        "Snapshot terbaru",
-        format_timestamp(stats["latest_timestamp_ms"]),
-    )
+def render_market_dashboard(settings) -> None:
+    try:
+        df, stats = load_snapshot_data(str(settings.database_path))
+    except RuntimeError as exc:
+        st.error(str(exc))
+        df, stats = pd.DataFrame(), {
+            "total_snapshots": 0,
+            "total_symbols": 0,
+            "latest_timestamp_ms": None,
+            "oldest_timestamp_ms": None,
+        }
 
-else:
-    if stats["total_snapshots"] > MAX_DISPLAY_ROWS:
-        st.warning(
-            f"Database berisi {stats['total_snapshots']:,} snapshot. "
-            f"Tabel dan grafik hanya memuat maksimal "
-            f"{MAX_DISPLAY_ROWS:,} snapshot terbaru."
+    try:
+        scan_df = load_scan_diagnostics(str(settings.database_path))
+    except RuntimeError as exc:
+        st.error(str(exc))
+        scan_df = pd.DataFrame()
+
+    st.header("Diagnostik Scanner")
+    st.caption("Ringkasan pemindaian dari riwayat tersimpan. Scanner tidak dijalankan oleh dashboard.")
+
+    if scan_df.empty:
+        st.info("Belum ada riwayat scan di tabel scan_runs.")
+        cols = st.columns(4)
+        cols[0].metric("Riwayat scan dimuat", 0)
+        cols[1].metric("Kandidat terakhir", 0)
+        cols[2].metric("Peluang profitable", 0)
+        cols[3].metric("Durasi terakhir", "Belum ada")
+    else:
+        latest = scan_df.iloc[0]
+        completed = int((scan_df["status"] == "completed").sum())
+        failed = int((scan_df["status"] == "failed").sum())
+
+        cols = st.columns(4)
+        cols[0].metric("Riwayat scan dimuat", f"{len(scan_df):,}")
+        cols[1].metric("Kandidat scan terakhir", f"{safe_int(latest['candidates_found']):,}")
+        cols[2].metric("Peluang profitable terakhir", f"{safe_int(latest['profitable_candidates']):,}")
+        cols[3].metric("Durasi scan terakhir", f"{safe_int(latest['duration_ms']):,} ms")
+
+        if pd.notna(latest["started_at"]):
+            st.caption(f"Waktu scan terakhir: {latest['started_at'].strftime('%d-%m-%Y %H:%M:%S WIB')}")
+
+        cols = st.columns(4)
+        cols[0].metric("Scan completed", f"{completed:,}")
+        cols[1].metric("Scan failed", f"{failed:,}")
+        cols[2].metric("Order book diperiksa", f"{safe_int(latest['order_books_attempted']):,}")
+        cols[3].metric("Snapshot tersimpan", f"{safe_int(latest['snapshots_saved']):,}")
+
+        if latest["status"] == "failed":
+            st.error(
+                f"Scan terakhir FAILED. Tipe: {latest['error_type'] or 'Tidak diketahui'}. "
+                f"Pesan: {latest['error_message'] or 'Tidak ada detail error'}"
+            )
+
+        st.subheader("Hasil pemeriksaan scan terakhir")
+        rejection_labels = {
+            "Order book gagal": "order_books_failed",
+            "Order book tidak valid": "invalid_order_books",
+            "Metadata market tidak valid": "invalid_market_metadata",
+            "Kedalaman order book kurang": "insufficient_depth",
+            "Error estimasi": "estimation_errors",
+            "Di bawah target profit": "below_profit_target",
+        }
+        rejection_df = pd.DataFrame(
+            [
+                {"Kategori": label, "Jumlah": safe_int(latest[column])}
+                for label, column in rejection_labels.items()
+            ]
+        ).sort_values("Jumlah", ascending=True)
+        fig = px.bar(
+            rejection_df, x="Jumlah", y="Kategori", orientation="h",
+            text="Jumlah", title="Kategori diagnostik pada scan terakhir",
+        )
+        fig.update_layout(showlegend=False, margin=dict(l=10, r=10, t=50, b=10))
+        st.plotly_chart(fig, width="stretch")
+        st.caption(
+            "Kategori diagnostik bukan selalu jumlah kandidat unik. "
+            "Satu kandidat dapat melewati beberapa tahap pemeriksaan."
         )
 
-    col1, col2, col3 = st.columns(3)
+        st.subheader("Tren diagnostik")
+        trend_df = scan_df.dropna(subset=["started_at"]).sort_values(
+            ["started_at_ms", "id"]
+        ).copy()
+        trend_options = {
+            "Jumlah kandidat": ("candidates_found", "Jumlah kandidat"),
+            "Peluang profitable": ("profitable_candidates", "Jumlah peluang profitable"),
+            "Order book diperiksa": ("order_books_attempted", "Jumlah order book diperiksa"),
+            "Order book gagal": ("order_books_failed", "Jumlah order book gagal"),
+            "Durasi scan (ms)": ("duration_ms", "Durasi scan (ms)"),
+            "Snapshot tersimpan": ("snapshots_saved", "Jumlah snapshot tersimpan"),
+        }
+        selected_trend = st.selectbox("Metrik tren", list(trend_options))
+        trend_column, trend_title = trend_options[selected_trend]
+        if not trend_df.empty:
+            fig = px.line(
+                trend_df, x="started_at", y=trend_column, markers=True,
+                title=trend_title,
+                labels={"started_at": "Waktu scan (WIB)", trend_column: trend_title},
+            )
+            fig.update_layout(hovermode="x unified", margin=dict(l=10, r=10, t=50, b=10))
+            st.plotly_chart(fig, width="stretch")
+        else:
+            st.info("Waktu scan tidak tersedia untuk grafik tren.")
 
-    col1.metric(
-        "Total snapshot",
-        f"{stats['total_snapshots']:,}",
-    )
-    col2.metric(
-        "Market tercatat",
-        f"{stats['total_symbols']:,}",
-    )
-    col3.metric(
-        "Snapshot terbaru",
-        format_timestamp(stats["latest_timestamp_ms"]),
-    )
+        st.subheader("Riwayat scan")
+        history_columns = [
+            "id", "started_at", "duration_ms", "status", "candidates_found",
+            "order_books_attempted", "order_books_failed", "invalid_order_books",
+            "invalid_market_metadata", "insufficient_depth", "estimation_errors",
+            "below_profit_target", "profitable_candidates", "snapshots_saved",
+            "snapshot_save_failures", "error_type", "error_message",
+        ]
+        history_df = scan_df[history_columns].copy().rename(
+            columns={
+                "id": "ID", "started_at": "Waktu (WIB)", "duration_ms": "Durasi (ms)",
+                "status": "Status", "candidates_found": "Kandidat",
+                "order_books_attempted": "Order book diperiksa",
+                "order_books_failed": "Order book gagal",
+                "invalid_order_books": "Order book tidak valid",
+                "invalid_market_metadata": "Metadata tidak valid",
+                "insufficient_depth": "Depth kurang",
+                "estimation_errors": "Error estimasi",
+                "below_profit_target": "Di bawah target",
+                "profitable_candidates": "Profitable",
+                "snapshots_saved": "Snapshot tersimpan",
+                "snapshot_save_failures": "Gagal simpan snapshot",
+                "error_type": "Tipe error", "error_message": "Pesan error",
+            }
+        )
+        st.dataframe(history_df, width="stretch", hide_index=True, height=400)
+        st.download_button(
+            "Ekspor riwayat scan ke CSV",
+            data=history_df.to_csv(index=False).encode("utf-8-sig"),
+            file_name="scan_diagnostics.csv",
+            mime="text/csv",
+            width="stretch",
+        )
 
     st.divider()
-    st.subheader("Filter data")
+    st.header("Snapshot Pasar")
 
-    symbols = sorted(df["symbol"].dropna().unique().tolist())
+    if stats["total_snapshots"] == 0 or df.empty:
+        st.info("Belum ada snapshot pasar untuk ditampilkan. Diagnostik scanner tetap tersedia.")
+        cols = st.columns(3)
+        cols[0].metric("Total snapshot", f"{stats['total_snapshots']:,}")
+        cols[1].metric("Market tercatat", f"{stats['total_symbols']:,}")
+        cols[2].metric("Snapshot terbaru", format_timestamp(stats["latest_timestamp_ms"]))
+        return
 
-    filter_col1, filter_col2 = st.columns([1, 2])
-
-    with filter_col1:
-        selected_symbols = st.multiselect(
-            "Pilih simbol",
-            options=symbols,
-            default=symbols,
-            help="Kosongkan pilihan untuk menampilkan tanpa data.",
+    if stats["total_snapshots"] > MAX_DISPLAY_ROWS:
+        st.warning(
+            f"Database memiliki {stats['total_snapshots']:,} snapshot. "
+            f"Tabel dan grafik memuat maksimal {MAX_DISPLAY_ROWS:,} data terbaru."
         )
 
+    cols = st.columns(3)
+    cols[0].metric("Total snapshot", f"{stats['total_snapshots']:,}")
+    cols[1].metric("Market tercatat", f"{stats['total_symbols']:,}")
+    cols[2].metric("Snapshot terbaru", format_timestamp(stats["latest_timestamp_ms"]))
+
+    st.subheader("Filter data")
+    symbols = sorted(df["symbol"].dropna().unique().tolist())
+    filter_col1, filter_col2 = st.columns([1, 2])
+    with filter_col1:
+        selected_symbols = st.multiselect(
+            "Pilih simbol", options=symbols, default=symbols,
+            help="Kosongkan pilihan untuk menampilkan tanpa data.",
+        )
     with filter_col2:
         valid_dates = df["timestamp"].dropna().dt.date
-
-        if valid_dates.empty:
-            date_range = None
-        else:
+        date_range = None
+        if not valid_dates.empty:
             date_range = st.date_input(
                 "Rentang tanggal (WIB)",
                 value=(min(valid_dates), max(valid_dates)),
@@ -736,205 +896,160 @@ else:
                 max_value=max(valid_dates),
             )
 
-    filtered_df = df.copy()
-
-    if selected_symbols:
-        filtered_df = filtered_df[
-            filtered_df["symbol"].isin(selected_symbols)
-        ]
-    else:
-        filtered_df = filtered_df.iloc[0:0]
-
-    if date_range:
-        if isinstance(date_range, (tuple, list)) and len(date_range) == 2:
+    filtered_df = df[df["symbol"].isin(selected_symbols)].copy() if selected_symbols else df.iloc[0:0].copy()
+    if date_range and isinstance(date_range, (tuple, list)):
+        if len(date_range) == 2:
             start_date, end_date = date_range
             filtered_dates = filtered_df["timestamp"].dt.date
-
             filtered_df = filtered_df[
-                (filtered_dates >= start_date)
-                & (filtered_dates <= end_date)
+                (filtered_dates >= start_date) & (filtered_dates <= end_date)
             ]
-
-        elif isinstance(date_range, (tuple, list)) and len(date_range) == 1:
-            selected_date = date_range[0]
-
+        elif len(date_range) == 1:
             filtered_df = filtered_df[
-                filtered_df["timestamp"].dt.date == selected_date
+                filtered_df["timestamp"].dt.date == date_range[0]
             ]
 
     if filtered_df.empty:
         st.warning("Tidak ada snapshot untuk filter yang dipilih.")
+        return
 
-    else:
-        latest_rows = filtered_df.sort_values(
-            ["timestamp_ms", "id"],
-            ascending=[False, False],
-        )
+    latest_rows = filtered_df.sort_values(
+        ["timestamp_ms", "id"], ascending=[False, False]
+    )
+    latest_row = latest_rows.iloc[0]
+    best_row = filtered_df.loc[filtered_df["net_profit_pct"].idxmax()]
 
-        latest_row = latest_rows.iloc[0]
+    cols = st.columns(3)
+    cols[0].metric("Snapshot sesuai filter", f"{len(filtered_df):,}")
+    cols[1].metric(
+        "Estimasi profit terbaru",
+        format_rupiah(latest_row["net_profit_idr"]),
+        help=f"{latest_row['symbol']} — {latest_row['net_profit_pct']:.4f}%",
+    )
+    cols[2].metric(
+        "Profit % tertinggi dalam data",
+        f"{best_row['net_profit_pct']:.4f}%",
+        help=f"{best_row['symbol']} — {format_rupiah(best_row['net_profit_idr'])}",
+    )
+    st.caption(
+        "Profit adalah estimasi historis per snapshot, bukan profit yang "
+        "sudah direalisasikan. Hasil aktual dapat berbeda akibat biaya, "
+        "slippage, likuiditas, dan perubahan harga."
+    )
 
-        best_row = filtered_df.loc[
-            filtered_df["net_profit_pct"].idxmax()
+    st.subheader("Grafik estimasi profit bersih")
+    chart_metric = st.radio(
+        "Metrik grafik",
+        ["Profit bersih (IDR)", "Profit bersih (%)", "Spread (%)"],
+        horizontal=True,
+    )
+    metric_mapping = {
+        "Profit bersih (IDR)": ("net_profit_idr", "Estimasi profit bersih (IDR)"),
+        "Profit bersih (%)": ("net_profit_pct", "Estimasi profit bersih (%)"),
+        "Spread (%)": ("spread_pct", "Spread (%)"),
+    }
+    y_column, y_title = metric_mapping[chart_metric]
+    chart_df = filtered_df.sort_values(["timestamp_ms", "id"]).copy()
+    fig = px.line(
+        chart_df, x="timestamp", y=y_column, color="symbol", markers=True,
+        title=y_title,
+        labels={
+            "timestamp": "Waktu (WIB)", y_column: y_title, "symbol": "Simbol"
+        },
+    )
+    fig.update_layout(
+        hovermode="x unified", legend_title_text="Simbol",
+        margin=dict(l=10, r=10, t=50, b=10),
+    )
+    st.plotly_chart(fig, width="stretch")
+
+    st.subheader("Riwayat snapshot")
+    display_df = latest_rows[
+        [
+            "timestamp", "exchange", "symbol", "bid", "ask", "spread_pct",
+            "quote_volume_idr", "net_profit_idr", "net_profit_pct",
         ]
-
-        col1, col2, col3 = st.columns(3)
-
-        col1.metric(
-            "Snapshot sesuai filter",
-            f"{len(filtered_df):,}",
-        )
-
-        col2.metric(
-            "Estimasi profit terbaru",
-            format_rupiah(float(latest_row["net_profit_idr"])),
-            help=(
-                f"{latest_row['symbol']} — "
-                f"{latest_row['net_profit_pct']:.4f}%"
-            ),
-        )
-
-        col3.metric(
-            "Profit % tertinggi dalam data",
-            f"{best_row['net_profit_pct']:.4f}%",
-            help=(
-                f"{best_row['symbol']} — "
-                f"{format_rupiah(float(best_row['net_profit_idr']))}"
-            ),
-        )
-
-        st.caption(
-            "Profit adalah estimasi historis per snapshot, bukan profit "
-            "yang sudah direalisasikan. Hasil aktual dapat berbeda akibat "
-            "biaya, slippage, likuiditas, dan perubahan harga."
-        )
-
-        st.divider()
-        st.subheader("Grafik estimasi profit bersih")
-
-        chart_metric = st.radio(
-            "Metrik grafik",
-            options=[
-                "Profit bersih (IDR)",
-                "Profit bersih (%)",
-                "Spread (%)",
-            ],
-            horizontal=True,
-        )
-
-        metric_mapping = {
-            "Profit bersih (IDR)": (
-                "net_profit_idr",
-                "Estimasi profit bersih (IDR)",
-            ),
-            "Profit bersih (%)": (
-                "net_profit_pct",
-                "Estimasi profit bersih (%)",
-            ),
-            "Spread (%)": (
-                "spread_pct",
-                "Spread (%)",
-            ),
+    ].copy().rename(
+        columns={
+            "timestamp": "Waktu (WIB)", "exchange": "Exchange", "symbol": "Simbol",
+            "bid": "Bid", "ask": "Ask", "spread_pct": "Spread (%)",
+            "quote_volume_idr": "Volume quote (IDR)",
+            "net_profit_idr": "Estimasi profit (IDR)",
+            "net_profit_pct": "Estimasi profit (%)",
         }
+    )
+    st.dataframe(
+        display_df, width="stretch", hide_index=True, height=450,
+        column_config={
+            "Bid": st.column_config.NumberColumn(format="Rp%.8f"),
+            "Ask": st.column_config.NumberColumn(format="Rp%.8f"),
+            "Spread (%)": st.column_config.NumberColumn(format="%.4f%%"),
+            "Volume quote (IDR)": st.column_config.NumberColumn(format="Rp%.2f"),
+            "Estimasi profit (IDR)": st.column_config.NumberColumn(format="Rp%.2f"),
+            "Estimasi profit (%)": st.column_config.NumberColumn(format="%.4f%%"),
+        },
+    )
+    st.download_button(
+        "Ekspor snapshot terfilter ke CSV",
+        data=display_df.to_csv(index=False).encode("utf-8-sig"),
+        file_name="market_snapshots.csv",
+        mime="text/csv",
+        width="stretch",
+    )
 
-        y_column, y_title = metric_mapping[chart_metric]
 
-        chart_df = filtered_df.sort_values(
-            ["timestamp_ms", "id"]
-        ).copy()
+# ============================================================
+# APLIKASI UTAMA
+# ============================================================
 
-        figure = px.line(
-            chart_df,
-            x="timestamp",
-            y=y_column,
-            color="symbol",
-            markers=True,
-            title=y_title,
-            labels={
-                "timestamp": "Waktu (WIB)",
-                y_column: y_title,
-                "symbol": "Simbol",
-            },
-        )
+st.title("📊 Crypto Trading Bot")
 
-        figure.update_layout(
-            hovermode="x unified",
-            legend_title_text="Simbol",
-            margin=dict(l=10, r=10, t=50, b=10),
-        )
+try:
+    settings = load_settings()
+except (ValueError, OSError) as exc:
+    st.error(f"Konfigurasi aplikasi tidak valid: {exc}")
+    st.stop()
 
-        st.plotly_chart(
-            figure,
-            width="stretch",
-        )
+# Pengamanan yang sudah ada: aplikasi tetap dikonfigurasi dalam PAPER mode.
+if settings.trading_mode != "PAPER":
+    st.error(
+        "Dashboard hanya mengizinkan konfigurasi TRADING_MODE=PAPER. "
+        "Ubah konfigurasi ke PAPER sebelum melanjutkan."
+    )
+    st.stop()
 
-        st.divider()
-        st.subheader("Riwayat snapshot")
+with st.sidebar:
+    st.header("Navigasi")
+    page = st.radio(
+        "Pilih halaman",
+        options=["Analisis Pasar", "Paper Trading", "Akun Real Indodax"],
+        index=0,
+    )
+    st.divider()
+    st.header("Pengaturan")
+    st.success("Mode aplikasi: PAPER")
+    st.write(f"Exchange: `{settings.exchange_id}`")
+    st.write(f"Market: `{settings.market_type}`")
+    st.write(f"Timeframe: `{settings.timeframe}`")
+    st.caption("Tidak ada order real yang dikirim.")
+    st.caption("Dashboard tidak menjalankan scanner otomatis.")
+    if st.button("🔄 Muat ulang data", width="stretch"):
+        st.cache_data.clear()
+        st.session_state.pop("real_account_balances", None)
+        st.session_state.pop("real_account_error", None)
+        st.session_state.pop("paper_ticker", None)
+        st.rerun()
+    st.divider()
+    st.caption("Database")
+    st.code(str(settings.database_path), language="text")
 
-        display_df = latest_rows[
-            [
-                "timestamp",
-                "exchange",
-                "symbol",
-                "bid",
-                "ask",
-                "spread_pct",
-                "quote_volume_idr",
-                "net_profit_idr",
-                "net_profit_pct",
-            ]
-        ].copy().rename(
-            columns={
-                "timestamp": "Waktu (WIB)",
-                "exchange": "Exchange",
-                "symbol": "Simbol",
-                "bid": "Bid",
-                "ask": "Ask",
-                "spread_pct": "Spread (%)",
-                "quote_volume_idr": "Volume quote (IDR)",
-                "net_profit_idr": "Estimasi profit (IDR)",
-                "net_profit_pct": "Estimasi profit (%)",
-            }
-        )
-
-        st.dataframe(
-            display_df,
-            width="stretch",
-            hide_index=True,
-            height=450,
-            column_config={
-                "Bid": st.column_config.NumberColumn(
-                    format="Rp%.8f",
-                ),
-                "Ask": st.column_config.NumberColumn(
-                    format="Rp%.8f",
-                ),
-                "Spread (%)": st.column_config.NumberColumn(
-                    format="%.4f%%",
-                ),
-                "Volume quote (IDR)": st.column_config.NumberColumn(
-                    format="Rp%.2f",
-                ),
-                "Estimasi profit (IDR)": st.column_config.NumberColumn(
-                    format="Rp%.2f",
-                ),
-                "Estimasi profit (%)": st.column_config.NumberColumn(
-                    format="%.4f%%",
-                ),
-            },
-        )
-
-        st.download_button(
-            label="Ekspor snapshot terfilter ke CSV",
-            data=display_df.to_csv(index=False).encode("utf-8-sig"),
-            file_name="market_snapshots.csv",
-            mime="text/csv",
-            width="stretch",
-        )
-
-st.divider()
-
-st.caption(
-    "Mode PAPER — dashboard hanya membaca database. "
-    "Tidak ada order yang dikirim dan tidak ada scan otomatis. "
-    "Estimasi profit bukan jaminan keuntungan aktual."
-)
+if page == "Paper Trading":
+    render_paper_dashboard(settings)
+elif page == "Akun Real Indodax":
+    render_real_account_dashboard()
+else:
+    st.caption(
+        "Dashboard analisis membaca database dalam mode read-only. "
+        "Estimasi profit bukan jaminan keuntungan aktual."
+    )
+    render_market_dashboard(settings)

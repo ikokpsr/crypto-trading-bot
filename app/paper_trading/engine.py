@@ -86,7 +86,7 @@ class PaperTradingEngine:
         
         try:
             gross_cost = quantity * price
-            fee = gross_cost * self.config.fee_rate
+            fee = gross_cost * self.config.buy_fee_rate
             total_cost = gross_cost + fee
 
             self._validate_finite_results(
@@ -225,7 +225,7 @@ class PaperTradingEngine:
             )
 
             gross_proceeds = quantity * price
-            fee = gross_proceeds * self.config.fee_rate
+            fee = gross_proceeds * self.config.sell_fee_rate
             net_proceeds = gross_proceeds - fee
 
             entry_fee_allocated = (

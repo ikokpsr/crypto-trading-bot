@@ -17,9 +17,11 @@ class OrderStatus(str, Enum):
 @dataclass(frozen=True)
 class PaperConfig:
     initial_balance_idr: Decimal = Decimal("1000000")
-    fee_rate: Decimal = Decimal("0.002")
+    buy_fee_rate: Decimal = Decimal("0.0020555")
+    sell_fee_rate: Decimal = Decimal("0.0041555")
+    # Kompatibilitas dengan konfigurasi lama.
+    fee_rate: Decimal | None = None
 
-    
     def __post_init__(self) -> None:
         if not isinstance(self.initial_balance_idr, Decimal):
             raise ValueError("Saldo awal harus bertipe Decimal.")
@@ -30,14 +32,36 @@ class PaperConfig:
         if self.initial_balance_idr <= 0:
             raise ValueError("Saldo awal harus lebih besar dari nol.")
 
-        if not isinstance(self.fee_rate, Decimal):
-            raise ValueError("Fee harus bertipe Decimal.")
+        if self.fee_rate is not None:
+            if not isinstance(self.fee_rate, Decimal):
+                raise ValueError("Fee harus bertipe Decimal.")
 
-        if not self.fee_rate.is_finite():
-            raise ValueError("Fee harus berupa angka finite.")
+            if (
+                not self.fee_rate.is_finite()
+                or not Decimal("0") <= self.fee_rate < Decimal("1")
+            ):
+                raise ValueError(
+                    "Fee harus berada dalam rentang 0 sampai kurang dari 1."
+                )
 
-        if not Decimal("0") <= self.fee_rate < Decimal("1"):
-            raise ValueError("Fee harus berada dalam rentang 0 sampai kurang dari 1.")
+            # Jika kode lama memberikan fee_rate secara eksplisit,
+            # pertahankan perilaku lama untuk kedua sisi transaksi.
+            object.__setattr__(self, "buy_fee_rate", self.fee_rate)
+            object.__setattr__(self, "sell_fee_rate", self.fee_rate)
+
+        for name in ("buy_fee_rate", "sell_fee_rate"):
+            rate = getattr(self, name)
+
+            if not isinstance(rate, Decimal):
+                raise ValueError(f"{name} harus bertipe Decimal.")
+
+            if (
+                not rate.is_finite()
+                or not Decimal("0") <= rate < Decimal("1")
+            ):
+                raise ValueError(
+                    f"{name} harus berada dalam rentang 0 sampai kurang dari 1."
+                )
 
 @dataclass(frozen=True)
 class PaperPosition:
